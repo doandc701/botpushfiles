@@ -1,0 +1,13 @@
+.venv/
+.env
+__pycache__/
+downloads/
+telegram-bot-api/
+bot-api-data/
+*.log
+dist/
+*.session
+*.session-journal
+.git/
+.github/
+tests/

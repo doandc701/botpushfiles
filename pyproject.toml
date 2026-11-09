@@ -1,0 +1,23 @@
+[project]
+name = "botpushfiles"
+version = "1.0.0"
+description = "Telegram bot: paste a link or send a file and it gets uploaded to Telegram."
+requires-python = ">=3.12"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = ["telegram-bot-api", "bot-api-data", "downloads", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "I", "ASYNC"]
+# stat() on a just-downloaded local file is cheap; wrapping it in a thread adds nothing.
+ignore = ["ASYNC240"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["bot"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

@@ -1,0 +1,31 @@
+# Bot + local Telegram Bot API server (files up to 2000 MB). Values come from .env.
+# Start: docker compose up -d --build    Logs: docker compose logs -f bot
+services:
+  bot-api:
+    image: aiogram/telegram-bot-api:latest
+    restart: unless-stopped
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+      TELEGRAM_LOCAL: "1"
+    volumes:
+      - bot-api-data:/var/lib/telegram-bot-api
+      # Same path as in the bot container, so the server can read downloaded files directly.
+      - downloads:/app/downloads
+
+  bot:
+    build: .
+    # on-failure: when another machine takes the bot over, the bot exits 0 and stays stopped.
+    # Take it back with: sudo docker compose up -d
+    restart: on-failure
+    env_file: .env
+    environment:
+      LOCAL_BOT_API_URL: http://bot-api:8081
+    volumes:
+      - downloads:/app/downloads
+    depends_on:
+      - bot-api
+
+volumes:
+  bot-api-data:
+  downloads:
