@@ -44,7 +44,9 @@ from telethon.tl.types import (
     InputFileBig,
 )
 
-load_dotenv()
+# Folder with .env, downloads and the MTProto session: the project folder, or the one the settings app passes.
+HOME = Path(os.getenv("BOTPUSHFILES_HOME") or Path(__file__).resolve().parent)
+load_dotenv(HOME / ".env")
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -66,7 +68,7 @@ MAX_SIZE_MB = int(os.getenv("MAX_SIZE_MB") or (2000 if LOCAL_BOT_API_URL or MTPR
 MAX_SIZE = MAX_SIZE_MB * 1024 * 1024
 # Optional proxy for downloads, e.g. http://host:8080 or socks5://host:1080
 PROXY = os.getenv("PROXY", "").strip() or None
-DOWNLOAD_DIR = Path(__file__).resolve().parent / "downloads"
+DOWNLOAD_DIR = HOME / "downloads"
 # System ffmpeg if installed, otherwise the binary bundled with imageio-ffmpeg.
 FFMPEG = shutil.which("ffmpeg") or imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -737,7 +739,7 @@ async def start_mtproto(app: Application) -> None:
     global mtproto
     if not MTPROTO_UPLOAD:
         return
-    client = TelegramClient(str(Path(__file__).resolve().parent / "mtproto"), API_ID, API_HASH, receive_updates=False)
+    client = TelegramClient(str(HOME / "mtproto"), API_ID, API_HASH, receive_updates=False)
     try:
         await client.start(bot_token=BOT_TOKEN)
     except Exception:
@@ -795,9 +797,13 @@ def build_app() -> Application:
     return app
 
 
-if __name__ == "__main__":
-    DOWNLOAD_DIR.mkdir(exist_ok=True)
+def main() -> None:
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     if not ALLOWED_USER_IDS:
         log.warning("ALLOWED_USER_IDS is empty: anyone who finds this bot can use it.")
     log.info("Bot started. Target: %s, max size: %d MB", TARGET_CHAT_ID or "same chat", MAX_SIZE_MB)
     build_app().run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()

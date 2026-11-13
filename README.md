@@ -11,6 +11,45 @@ cp .env.example .env   # rồi điền BOT_TOKEN, TARGET_CHAT_ID, ALLOWED_USER_I
 .venv/bin/python bot.py
 ```
 
+## App cài đặt (Windows / macOS / Ubuntu)
+
+App có giao diện để cài và quản lý bot, không cần sửa `.env` bằng tay:
+
+- **Cài đặt**: điền token, channel, user ID, API ID/hash, proxy. Nút **Kiểm tra** hỏi Telegram xem token có đúng và
+  bot đã là admin của channel chưa.
+- **Bật / Tắt / Khởi động lại** bot. Trạng thái cập nhật liên tục.
+- **Log**: xem log của bot trực tiếp.
+- **Tự chạy khi bật máy**: Windows dùng Task Scheduler, macOS dùng LaunchAgent, Ubuntu dùng systemd.
+- **Icon ở khay hệ thống** (góc màn hình): bấm vào icon để mở lại cửa sổ cài đặt. Chuột phải để bật/tắt hoặc
+  khởi động lại bot. Icon có màu khi bot đang chạy, xám khi bot tắt. Đóng cửa sổ cài đặt thì bot và icon vẫn chạy.
+  Bật **Tự chạy khi bật máy** thì icon cũng tự hiện sau khi đăng nhập.
+- Trên Ubuntu, mở app lần đầu sẽ thêm **Bot Push Files** vào menu ứng dụng (phím Super → gõ tên).
+
+**Cách 1: tải app đã đóng gói.** Vào GitHub → **Actions** → **Build app** → **Run workflow**. Chạy xong, tải file
+`BotPushFiles-windows.zip`, `-macos.zip` hoặc `-linux.tar.gz` ở mục *Artifacts*, giải nén rồi mở `BotPushFiles`.
+App đã có sẵn bot bên trong, không cần cài Python. Cài đặt và log nằm ở:
+
+| Hệ điều hành | Thư mục |
+|---|---|
+| Windows | `%APPDATA%\botpushfiles` |
+| macOS | `~/Library/Application Support/botpushfiles` |
+| Ubuntu | `~/.config/botpushfiles` |
+
+macOS báo app "không xác định được nhà phát triển": chuột phải vào app → **Open** → **Open** (chỉ lần đầu).
+
+**Cách 2: chạy từ mã nguồn.** Dùng chính thư mục dự án và `.env` hiện có:
+
+```bash
+.venv/bin/pip install -r requirements-app.txt
+.venv/bin/python settings_app.py
+```
+
+Trên Windows dùng `.venv\Scripts\python settings_app.py`. Đóng gói cho máy đang dùng: `python build_app.py`
+(kết quả trong `dist/`).
+
+Trên Windows/macOS không có Local Bot API server. Hãy điền API ID/hash và bật **Upload qua MTProto** để gửi file
+tới 2000 MB.
+
 ## Cách dùng
 
 - Dán 1 hoặc nhiều link vào chat (hoặc `/up <link>`): bot tải file về rồi upload.
@@ -71,6 +110,8 @@ Quy trình sửa code:
 - Lộ token: @BotFather → `/revoke`, rồi xoá `mtproto.session` và cập nhật `.env`.
 
 ## Tự chạy khi bật máy
+
+Bật công tắc **Tự chạy khi bật máy** trong app, hoặc trên Ubuntu chạy:
 
 ```bash
 ./install-autostart.sh                       # cài service systemd, bot tự bật và tự chạy lại khi lỗi

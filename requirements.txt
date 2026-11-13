@@ -6,3 +6,4 @@ httpx[socks]
 imageio-ffmpeg>=0.5
 telethon>=1.40
 cryptg>=0.4
+psutil>=6.0

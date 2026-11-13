@@ -17,7 +17,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=$DIR/start.sh
+ExecStart=$DIR/.venv/bin/python $DIR/run_bot.py
 WorkingDirectory=$DIR
 Environment=PYTHONUNBUFFERED=1
 # on-failure: when another machine takes the bot over, bot.py exits 0 and should stay stopped until next boot.

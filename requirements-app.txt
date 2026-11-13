@@ -1,0 +1,5 @@
+-r requirements.txt
+flet[all]>=1.1,<2
+PySide6-Essentials>=6.8
+pyinstaller>=6.0
+Pillow>=10.0

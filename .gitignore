@@ -11,3 +11,10 @@ dist/
 *.session-journal
 .pytest_cache/
 .ruff_cache/
+build/
+*.spec
+bot.pid
+bot.log.1
+launcher.log
+tray.pid
+ui.pid

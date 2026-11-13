@@ -30,6 +30,19 @@ CI (`.github/workflows/ci.yml`) runs ruff + pytest on Python 3.12 and 3.14, Shel
   `TAKEOVER_GRACE` seconds ago, so the newest machine keeps the bot. This relies on `Restart=on-failure` (systemd)
   and `restart: on-failure` (Docker); `Restart=always` would make machines fight.
 
+## Settings app
+
+- `settings_app.py` (Flet 1.x UI) → `botctl.py` (OS-specific logic, no UI, never imports `bot`) → `run_bot.py`
+  (launcher: starts the local Bot API server if configured, runs `bot.py`, restarts on non-zero exit, stops on 0,
+  writes `bot.log` and `bot.pid`). systemd, LaunchAgent, Task Scheduler and `start.sh` all run the launcher.
+- Data folder (`botctl.app_home`, passed to the bot as `BOTPUSHFILES_HOME`): the project folder from source, a per-user
+  config folder in the packaged app. The packaged app runs itself with `--launcher` / `--bot`.
+- Tray icon: `tray_app.py` (PySide6, its own process: `settings_app.py --tray`), so it outlives the window. It works
+  on GNOME/Wayland through StatusNotifierItem. Single instance via `tray.pid` / `ui.pid` (`botctl.alive_pid`).
+  Start-at-login adds the tray too (XDG autostart, LaunchAgent, Task Scheduler). `make_icon.py` draws `assets/`.
+- `python build_app.py` packages the current OS (PyInstaller via `flet pack`); `.github/workflows/build-app.yml`
+  builds Windows, macOS and Linux.
+
 ## Rules
 
 - Never commit or print `.env`, `*.session` or `dist/` (they hold the bot token / login session).

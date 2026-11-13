@@ -1,0 +1,57 @@
+name: Build app
+
+# Builds the settings app for Windows, macOS and Linux. Run it by hand (Actions → Build app → Run workflow)
+# or push a tag like v1.2.0 to also attach the zips to a GitHub release.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows
+          - os: macos-latest
+            name: macos
+          - os: ubuntu-22.04
+            name: linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - name: Linux libraries for the Flet window
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-0 libmpv1 || sudo apt-get install -y libgtk-3-0 libmpv2
+      - run: pip install -r requirements-app.txt
+      - run: python build_app.py
+      - name: Zip
+        shell: bash
+        run: |
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "../BotPushFiles-${{ matrix.name }}.zip" BotPushFiles
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            ditto -c -k --keepParent BotPushFiles.app "../BotPushFiles-${{ matrix.name }}.zip"
+          else
+            tar czf "../BotPushFiles-${{ matrix.name }}.tar.gz" BotPushFiles
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BotPushFiles-${{ matrix.name }}
+          path: BotPushFiles-${{ matrix.name }}.*
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: BotPushFiles-${{ matrix.name }}.*

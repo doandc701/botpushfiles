@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
-# Start the local Bot API server (if configured) and the bot together; Ctrl+C stops both.
+# Run the bot (and the local Bot API server, if LOCAL_BOT_API_URL points at this machine) in the foreground.
+# Logs go to bot.log. Ctrl+C stops everything. Same launcher as the settings app and start-at-login.
 set -euo pipefail
 cd "$(dirname "$0")"
-
-if grep -q '^LOCAL_BOT_API_URL=.\+' .env; then
-  ./run_bot_api.sh >bot-api.log 2>&1 &
-  trap 'kill $! 2>/dev/null' EXIT
-  sleep 3
-fi
-.venv/bin/python bot.py
+exec .venv/bin/python run_bot.py
