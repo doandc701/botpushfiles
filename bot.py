@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+import json
 import logging
 import os
 import random
@@ -20,7 +21,8 @@ import httpx
 import imageio_ffmpeg
 import yt_dlp
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, Update
+from telegram import Message as TgMessage
 from telegram.constants import ChatAction
 from telegram.error import Conflict, TelegramError
 from telegram.ext import (
@@ -69,6 +71,10 @@ DOWNLOAD_DIR = Path(__file__).resolve().parent / "downloads"
 FFMPEG = shutil.which("ffmpeg") or imageio_ffmpeg.get_ffmpeg_exe()
 
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+# NhacCuaTui song pages: /song/<key> and the older /bai-hat/<slug>.<key>.html. yt-dlp has no extractor for them.
+NCT_RE = re.compile(r"^https?://(?:www\.|m\.)?nhaccuatui\.com/(?:song/([\w-]+)|bai-hat/[^/?#]*\.([\w-]+)\.html)", re.I)
+# NhacCuaTui qualities from best to worst that Telegram plays in its music player; FLAC would arrive as a document.
+NCT_QUALITIES = ("320", "128")
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
 AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".ogg", ".opus", ".flac", ".wav"}
 # Telegram only shows .mp3 / .m4a in its music player; other audio files are sent as documents.
@@ -187,6 +193,24 @@ class Progress:
                 log.debug("status edit failed: %r", e)
 
 
+def extract_urls(message: TgMessage) -> list[str]:
+    """Links in a message as Telegram detected them (so "www.x.com/..." counts), plus hidden text links."""
+    found = []
+    for text, entities in ((message.text, message.entities), (message.caption, message.caption_entities)):
+        if not text:
+            continue
+        for entity in entities or ():
+            if entity.type == MessageEntity.TEXT_LINK:
+                found.append(entity.url)
+            elif entity.type == MessageEntity.URL:
+                # Offsets count UTF-16 code units, which matters when emoji come before the link.
+                utf16 = text.encode("utf-16-le")
+                found.append(utf16[2 * entity.offset : 2 * (entity.offset + entity.length)].decode("utf-16-le"))
+        found += URL_RE.findall(text)
+    urls = [u if re.match(r"https?://", u, re.I) else f"https://{u}" for u in found]
+    return list(dict.fromkeys(urls))  # De-duplicate, keeping order.
+
+
 def safe_name(name: str | None) -> str | None:
     """The last path component of a server-supplied name, or None if it is empty or a "." / ".." entry."""
     name = Path(name or "").name.strip()
@@ -246,14 +270,16 @@ def is_audio_only(info: dict) -> bool:
     )
 
 
-async def download_direct(url: str, dest_dir: str, progress: Progress) -> tuple[Path, dict]:
+async def download_direct(
+    url: str, dest_dir: str, progress: Progress, filename: str | None = None, headers: dict | None = None
+) -> tuple[Path, dict]:
     async with http_client() as client:
-        async with client.stream("GET", url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+        async with client.stream("GET", url, headers={"User-Agent": "Mozilla/5.0", **(headers or {})}) as resp:
             resp.raise_for_status()
             length = int(resp.headers.get("content-length") or 0)
             if length > MAX_SIZE:
                 raise TooLarge(human_size(length))
-            path = Path(dest_dir) / guess_filename(resp)
+            path = Path(dest_dir) / (safe_name(filename) or guess_filename(resp))
             size = 0
             start = time.monotonic()
             with path.open("wb") as f:
@@ -280,6 +306,47 @@ def ytdlp_opts(**extra) -> dict:
     if PROXY:
         opts["proxy"] = PROXY
     return opts
+
+
+def nct_song(html: str, key: str | None) -> dict:
+    """The song record from a NhacCuaTui page's Nuxt payload, with references resolved one level deep."""
+    match = re.search(r'<script[^>]*id="__NUXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
+    if not match:
+        raise yt_dlp.utils.DownloadError("NhacCuaTui page has no song data")
+    data = json.loads(match.group(1))
+
+    def value(ref):
+        return data[ref] if isinstance(ref, int) and 0 <= ref < len(data) else ref
+
+    songs = [d for d in data if isinstance(d, dict) and "streamURL" in d and "key" in d]
+    song = next((d for d in songs if value(d["key"]) == key), songs[0] if songs else None)
+    if song is None:
+        raise yt_dlp.utils.DownloadError("NhacCuaTui page has no song data")
+    streams = [{k: value(v) for k, v in value(ref).items()} for ref in value(song["streamURL"]) or ()]
+    return {
+        "title": value(song.get("name")),
+        "artist": value(song.get("artistName")),
+        "duration": int(value(song.get("duration")) or 0) or None,
+        "streams": [s for s in streams if s.get("stream") and s.get("status") == 1 and not s.get("onlyVIP")],
+    }
+
+
+async def download_nct(url: str, dest_dir: str, progress: Progress) -> tuple[Path, dict]:
+    match = NCT_RE.match(url)
+    async with http_client() as client:
+        resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+    song = nct_song(resp.text, match and (match.group(1) or match.group(2)))
+    by_quality = {s.get("type"): s["stream"] for s in song["streams"]}
+    quality = next((q for q in NCT_QUALITIES if q in by_quality), None)
+    if quality is None:
+        raise yt_dlp.utils.DownloadError("NhacCuaTui has no free MP3 for this song")
+    name = " - ".join(x for x in (song["artist"], song["title"]) if x) or "nhaccuatui"
+    path, _ = await download_direct(
+        by_quality[quality], dest_dir, progress, f"{name}.mp3", headers={"Referer": "https://www.nhaccuatui.com/"}
+    )
+    info = {"title": song["title"], "artist": song["artist"], "duration": song["duration"], "abr": int(quality)}
+    return path, info
 
 
 def estimate_size(info: dict) -> tuple[int, bool] | None:
@@ -515,7 +582,9 @@ async def process_url(context: ContextTypes.DEFAULT_TYPE, status, url: str, fmt:
             # Under Docker the Bot API server runs as another user and must be able to read the file.
             os.chmod(tmp, 0o755)
             started = time.monotonic()
-            if fmt:
+            if fmt == "nct":
+                path, info = await download_nct(url, tmp, progress)
+            elif fmt:
                 path, info = await asyncio.to_thread(download_ytdlp, url, tmp, fmt, progress)
             else:
                 path, info = await download_direct(url, tmp, progress)
@@ -523,7 +592,10 @@ async def process_url(context: ContextTypes.DEFAULT_TYPE, status, url: str, fmt:
             size = path.stat().st_size
             if size > MAX_SIZE:
                 raise TooLarge(human_size(size))
-            caption = f"{info['title'][:900]}\n{url}" if info.get("title") else url
+            title = info.get("title")
+            if fmt == "nct":
+                title = f"{' - '.join(x for x in (info.get('artist'), title) if x)} · MP3 {info['abr']} kbps"
+            caption = f"{title[:900]}\n{url}" if title else url
             started = time.monotonic()
             await upload(context, status, target, path, caption, info, progress)
             upload_time = time.monotonic() - started
@@ -559,14 +631,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def handle_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
-    text = update.message.text or update.message.caption or ""
-    urls = URL_RE.findall(text)
+    urls = extract_urls(update.message)
     if not urls:
         await update.message.reply_text("Không tìm thấy link nào. Dùng: /up <link>")
         return
 
     for url in urls:
         status = await update.message.reply_text(f"🔎 Đang kiểm tra: {url}", disable_web_page_preview=True)
+        if NCT_RE.match(url):
+            await process_url(context, status, url, "nct")
+            continue
         try:
             kind, info = await classify_link(url)
         except httpx.HTTPError as e:

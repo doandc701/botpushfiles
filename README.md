@@ -15,6 +15,8 @@ cp .env.example .env   # rồi điền BOT_TOKEN, TARGET_CHAT_ID, ALLOWED_USER_I
 
 - Dán 1 hoặc nhiều link vào chat (hoặc `/up <link>`): bot tải file về rồi upload.
 - Link video (TikTok, YouTube, file .mp4...): bot hiện nút chọn 🎬 MP4 / 📱 MP4 360p / 🎵 Audio gốc.
+- Link không cần `https://` (vd `www.nhaccuatui.com/...`), link ẩn trong chữ cũng nhận.
+- Link bài hát NhacCuaTui: bot tải luôn MP3 320 kbps (không có thì 128 kbps), gửi vào trình phát nhạc Telegram.
 - Link chỉ có âm thanh (SoundCloud, file .mp3...): bot tải luôn, không hỏi. Âm thanh luôn giữ nguyên chất lượng gốc (không mã hoá lại).
 - Gửi file/ảnh/video/audio: bot copy sang `TARGET_CHAT_ID` (không giới hạn dung lượng).
 - `/start`: xem hướng dẫn và user ID của bạn.

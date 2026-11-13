@@ -264,14 +264,14 @@ async def test_format_choice_rejects_strangers():
 
 
 async def test_links_without_url():
-    message = SimpleNamespace(text="hello", caption=None, reply_text=AsyncMock())
+    message = SimpleNamespace(text="hello", caption=None, entities=(), caption_entities=(), reply_text=AsyncMock())
     update = SimpleNamespace(effective_user=SimpleNamespace(id=111), message=message)
     await bot.handle_links(update, handler_context())
     message.reply_text.assert_awaited_once_with("Không tìm thấy link nào. Dùng: /up <link>")
 
 
 async def test_links_from_stranger_are_ignored():
-    message = SimpleNamespace(text="https://x", caption=None, reply_text=AsyncMock())
+    message = SimpleNamespace(text="https://x", caption=None, entities=(), caption_entities=(), reply_text=AsyncMock())
     update = SimpleNamespace(effective_user=SimpleNamespace(id=999), message=message)
     await bot.handle_links(update, handler_context())
     message.reply_text.assert_not_awaited()
@@ -316,9 +316,126 @@ async def test_pending_menus_are_capped(monkeypatch):
     monkeypatch.setattr(bot, "classify_link", AsyncMock(return_value=("video", {})))
     status = SimpleNamespace(edit_text=AsyncMock())
     reply = AsyncMock(return_value=status)
-    message = SimpleNamespace(text="https://a https://b https://c", caption=None, reply_text=reply)
+    text = "https://a https://b https://c"
+    message = SimpleNamespace(text=text, caption=None, entities=(), caption_entities=(), reply_text=reply)
     update = SimpleNamespace(effective_user=SimpleNamespace(id=111), message=message)
     context = handler_context()
     context.application = MagicMock()
     await bot.handle_links(update, context)
     assert list(context.bot_data["pending"].values()) == ["https://b", "https://c"]
+
+
+# --- Link extraction ----------------------------------------------------------------------------------------------
+
+
+def tg_message(text, entities=()):
+    from telegram import MessageEntity
+
+    ents = [MessageEntity(type=t, offset=o, length=n, url=u) for t, o, n, u in entities]
+    return SimpleNamespace(text=text, entities=ents, caption=None, caption_entities=())
+
+
+def test_extract_urls_accepts_links_without_scheme():
+    text = "www.nhaccuatui.com/song/jPTfR8A5fJ4o"
+    message = tg_message(text, [("url", 0, len(text), None)])
+    assert bot.extract_urls(message) == ["https://www.nhaccuatui.com/song/jPTfR8A5fJ4o"]
+
+
+def test_extract_urls_handles_emoji_offsets_and_text_links():
+    text = "🎵 nghe x.com/a và bấm đây"  # The emoji is 2 UTF-16 units, so x.com starts at offset 8, not 7.
+    message = tg_message(text, [("url", 8, 7, None), ("text_link", 25, 3, "https://y.com/b")])
+    assert bot.extract_urls(message) == ["https://x.com/a", "https://y.com/b"]
+
+
+def test_extract_urls_falls_back_to_regex_and_dedupes():
+    message = tg_message("https://a.com/x https://a.com/x", [("url", 0, 15, None)])
+    assert bot.extract_urls(message) == ["https://a.com/x"]
+
+
+# --- NhacCuaTui ---------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("url", "key"),
+    [
+        ("https://www.nhaccuatui.com/song/jPTfR8A5fJ4o", "jPTfR8A5fJ4o"),
+        ("https://nhaccuatui.com/song/jPTfR8A5fJ4o?source=app", "jPTfR8A5fJ4o"),
+        ("https://www.nhaccuatui.com/bai-hat/co-khong-giu-mat-dung-tim.jPTfR8A5fJ4o.html", "jPTfR8A5fJ4o"),
+    ],
+)
+def test_nct_url(url, key):
+    match = bot.NCT_RE.match(url)
+    assert match and (match.group(1) or match.group(2)) == key
+
+
+def test_nct_url_rejects_other_pages():
+    assert not bot.NCT_RE.match("https://www.nhaccuatui.com/playlist/abc")
+    assert not bot.NCT_RE.match("https://example.com/song/abc")
+
+
+def nct_page(key="KEY1", vip320=False):
+    """A NhacCuaTui page whose Nuxt payload holds a related song first and the requested song second."""
+    import json
+
+    data = [
+        {"related": 1, "song": 9},
+        {"key": 2, "name": 3, "artistName": 3, "duration": 4, "streamURL": 5},
+        "OTHER", "Bài khác", "100", [6], {"stream": 7, "type": 8, "status": 17, "onlyVIP": 18}, "https://a/other.mp3",
+        "128",
+        {"key": 10, "name": 11, "artistName": 12, "duration": 13, "streamURL": 14},
+        key, "Có Không Giữ Mất Đừng Tìm", "Cảnh Minh", "244", [15, 16, 19],
+        {"stream": 20, "type": 8, "status": 17, "onlyVIP": 18},
+        {"stream": 21, "type": 22, "status": 17, "onlyVIP": 23},
+        1, False,
+        {"stream": 24, "type": 25, "status": 17, "onlyVIP": 18},
+        "https://a/song.mp3", "https://a/song_hq.mp3", "320", vip320, "https://a/song.flac", "lossless",
+    ]
+    return f'<html><script type="application/json" id="__NUXT_DATA__">{json.dumps(data)}</script></html>'
+
+
+def test_nct_song_picks_requested_song_and_free_streams():
+    song = bot.nct_song(nct_page(), "KEY1")
+    assert (song["title"], song["artist"], song["duration"]) == ("Có Không Giữ Mất Đừng Tìm", "Cảnh Minh", 244)
+    assert [s["type"] for s in song["streams"]] == ["128", "320", "lossless"]
+    assert [s["type"] for s in bot.nct_song(nct_page(vip320=True), "KEY1")["streams"]] == ["128", "lossless"]
+
+
+def test_nct_song_without_data():
+    with pytest.raises(bot.yt_dlp.utils.DownloadError):
+        bot.nct_song("<html></html>", "KEY1")
+
+
+@pytest.mark.parametrize(("vip320", "quality", "stream"), [(False, 320, "song_hq.mp3"), (True, 128, "song.mp3")])
+async def test_download_nct_prefers_320_kbps(monkeypatch, tmp_path, vip320, quality, stream):
+    requested = []
+
+    def handler(request):
+        requested.append(request)
+        if request.url.host == "www.nhaccuatui.com":
+            return httpx.Response(200, text=nct_page(vip320=vip320))
+        return httpx.Response(200, content=b"ID3 audio")
+
+    mock_client(monkeypatch, handler)
+    progress = bot.Progress(FakeStatus(), asyncio.get_running_loop())
+    path, info = await bot.download_nct("https://www.nhaccuatui.com/song/KEY1", str(tmp_path), progress)
+    assert path == tmp_path / "Cảnh Minh - Có Không Giữ Mất Đừng Tìm.mp3"
+    assert path.read_bytes() == b"ID3 audio"
+    assert info == {"title": "Có Không Giữ Mất Đừng Tìm", "artist": "Cảnh Minh", "duration": 244, "abr": quality}
+    assert requested[1].url.path == f"/{stream}"
+    assert requested[1].headers["referer"] == "https://www.nhaccuatui.com/"
+
+
+async def test_nct_links_skip_ytdlp(monkeypatch):
+    process_url = AsyncMock()
+    classify = AsyncMock()
+    monkeypatch.setattr(bot, "process_url", process_url)
+    monkeypatch.setattr(bot, "classify_link", classify)
+    status = SimpleNamespace(edit_text=AsyncMock())
+    text = "www.nhaccuatui.com/song/KEY1"
+    message = tg_message(text, [("url", 0, len(text), None)])
+    message.reply_text = AsyncMock(return_value=status)
+    update = SimpleNamespace(effective_user=SimpleNamespace(id=111), message=message)
+    context = handler_context()
+    await bot.handle_links(update, context)
+    process_url.assert_awaited_once_with(context, status, "https://www.nhaccuatui.com/song/KEY1", "nct")
+    classify.assert_not_awaited()

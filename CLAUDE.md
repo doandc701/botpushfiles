@@ -21,6 +21,9 @@ CI (`.github/workflows/ci.yml`) runs ruff + pytest on Python 3.12 and 3.14, Shel
   (`FORMATS`); the URL is kept in `bot_data["pending"]` under a 12-hex key because callback data is limited to 64 bytes.
 - Downloads: httpx for direct files, yt-dlp for pages (with `curl_cffi` impersonation; TikTok returns 403 without it).
   Audio is copied out with ffmpeg without re-encoding (`extract_audio`).
+- Links come from Telegram entities (`extract_urls`), so `www.x.com` without a scheme works.
+- NhacCuaTui (`NCT_RE`, no yt-dlp extractor): `nct_song` reads the page's `__NUXT_DATA__` payload and
+  `download_nct` fetches the free 320 kbps MP3 (else 128). FLAC exists but Telegram would send it as a document.
 - Uploads: MTProto via Telethon when `TELEGRAM_API_ID/HASH` are set (real progress, 2000 MB), else the Bot API
   (local server at `LOCAL_BOT_API_URL` for 2000 MB, otherwise 50 MB). Files sent to the bot are `copy_message`d.
 - Takeover: only one machine may poll a token. On `Conflict` the bot exits with code 0 unless it started less than
