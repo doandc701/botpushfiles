@@ -308,7 +308,7 @@ async def test_other_errors_keep_running(monkeypatch):
 def test_build_app_registers_handlers():
     app = bot.build_app()
     assert app.error_handlers
-    assert sum(len(h) for h in app.handlers.values()) == 5
+    assert sum(len(h) for h in app.handlers.values()) == 6
 
 
 async def test_pending_menus_are_capped(monkeypatch):
@@ -438,4 +438,245 @@ async def test_nct_links_skip_ytdlp(monkeypatch):
     context = handler_context()
     await bot.handle_links(update, context)
     process_url.assert_awaited_once_with(context, status, "https://www.nhaccuatui.com/song/KEY1", "nct")
+    classify.assert_not_awaited()
+
+
+# --- NhacCuaTui playlists -----------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["https://www.nhaccuatui.com/playlist/nKqbhXzdXRtt", "https://www.nhaccuatui.com/playlist/hits.nKqbhXzdXRtt.html"],
+)
+def test_nct_playlist_url(url):
+    match = bot.NCT_PLAYLIST_RE.match(url)
+    assert match and (match.group(1) or match.group(2)) == "nKqbhXzdXRtt"
+    assert not bot.NCT_RE.match(url)
+
+
+def playlist_page(count=3):
+    """A playlist page payload: the playlist, then its songs (referenced by index), as NhacCuaTui lays it out."""
+    import json
+
+    data = [{"playlist": 1}, {"name": 2, "listSong": 3}, "2010s Hits", list(range(4, 4 + count))]
+    for i in range(count):
+        data.append({"key": f"K{i}", "name": f"Song {i}", "artistName": "Artist", "streamURL": []})
+    return f'<script type="application/json" id="__NUXT_DATA__">{json.dumps(data)}</script>'
+
+
+def test_nct_playlist_parses_songs_in_order():
+    title, songs = bot.nct_playlist(playlist_page())
+    assert title == "2010s Hits"
+    assert songs == [{"key": f"K{i}", "title": f"Song {i}", "artist": "Artist"} for i in range(3)]
+    with pytest.raises(bot.yt_dlp.utils.DownloadError):
+        bot.nct_playlist(nct_page())  # A song page is not a playlist.
+
+
+def buttons(markup):
+    return [[(b.text, b.callback_data) for b in row] for row in markup.inline_keyboard]
+
+
+async def test_playlist_menu_starts_with_everything_ticked(monkeypatch):
+    mock_client(monkeypatch, lambda request: httpx.Response(200, text=playlist_page(count=12)))
+    status = SimpleNamespace(edit_text=AsyncMock())
+    context = handler_context()
+    await bot.show_playlist(context, status, "https://www.nhaccuatui.com/playlist/P")
+    (key,) = context.bot_data["playlists"]
+    text = status.edit_text.await_args.args[0]
+    rows = buttons(status.edit_text.await_args.kwargs["reply_markup"])
+    assert "2010s Hits (12 bài)" in text and "Đã chọn 12/12" in text
+    assert rows[0] == [("✅ 1. Artist - Song 0", f"pl:{key}:t:0")]
+    assert len(rows) == bot.PLAYLIST_PAGE_SIZE + 3  # songs, page row, select-all row, download row
+    assert rows[-1][0] == ("⬇️ Tải 12 bài", f"pl:{key}:go")
+
+
+def playlist_context(count=3):
+    pl = {"url": "https://p", "title": "Hits", "page": 0, "selected": set(range(count))}
+    pl["songs"] = [{"key": f"K{i}", "title": f"Song {i}", "artist": "A"} for i in range(count)]
+    return SimpleNamespace(bot_data={"playlists": {"k1": pl}}, bot=MagicMock()), pl
+
+
+async def test_playlist_toggle_and_select_all():
+    context, pl = playlist_context()
+    await bot.handle_playlist_choice(callback_update("pl:k1:t:1"), context)
+    assert pl["selected"] == {0, 2}
+    update = callback_update("pl:k1:none")
+    await bot.handle_playlist_choice(update, context)
+    assert pl["selected"] == set()
+    rows = buttons(update.callback_query.edit_message_text.await_args.kwargs["reply_markup"])
+    assert rows[0][0][0].startswith("⬜")
+    update = callback_update("pl:k1:go")
+    await bot.handle_playlist_choice(update, context)
+    update.callback_query.answer.assert_awaited_once_with("Chưa chọn bài nào.")
+    await bot.handle_playlist_choice(callback_update("pl:k1:all"), context)
+    assert pl["selected"] == {0, 1, 2}
+
+
+async def test_playlist_downloads_selected_songs_in_order(monkeypatch):
+    context, pl = playlist_context()
+    pl["selected"] = {2, 0}
+    process_url = AsyncMock(side_effect=["ok", "failed"])
+    monkeypatch.setattr(bot, "process_url", process_url)
+    update = callback_update("pl:k1:go")
+    await bot.handle_playlist_choice(update, context)
+    urls = [c.args[2] for c in process_url.await_args_list]
+    assert urls == ["https://www.nhaccuatui.com/song/K0", "https://www.nhaccuatui.com/song/K2"]
+    assert process_url.await_args_list[0].kwargs["prefix"].startswith("📃 Hits · bài 1/2: A - Song 0")
+    assert update.callback_query.message.texts[-1] == "✅ Playlist Hits: tải xong 1/2 bài.\n❌ Lỗi: A - Song 2"
+    assert context.bot_data["playlists"] == {}
+
+
+async def test_playlist_stop_and_expired(monkeypatch):
+    context, pl = playlist_context()
+
+    async def first_song_then_stop(*args, **kwargs):
+        await bot.handle_playlist_choice(callback_update("pl:k1:stop"), context)
+        return "ok"
+
+    process_url = AsyncMock(side_effect=first_song_then_stop)
+    monkeypatch.setattr(bot, "process_url", process_url)
+    update = callback_update("pl:k1:go")
+    await bot.handle_playlist_choice(update, context)
+    assert process_url.await_count == 1
+    assert "Đã dừng" in update.callback_query.message.texts[-1]
+    update = callback_update("pl:k1:t:0")
+    await bot.handle_playlist_choice(update, context)
+    assert "hết hạn" in update.callback_query.edit_message_text.await_args.args[0]
+
+
+# --- Skipping songs the channel already has -----------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def uploaded_registry(monkeypatch, tmp_path):
+    """Never touch the real uploaded.json."""
+    path = tmp_path / "uploaded.json"
+    monkeypatch.setattr(bot, "UPLOADED_PATH", path)
+    return path
+
+
+async def test_nct_song_is_recorded_then_skipped(monkeypatch, tmp_path):
+    monkeypatch.setattr(bot, "DOWNLOAD_DIR", tmp_path)
+    song = tmp_path / "song.mp3"
+    song.write_bytes(b"ID3")
+    download = AsyncMock(return_value=(song, {"title": "T", "artist": "A", "abr": 320}))
+    upload = AsyncMock(return_value=42)
+    monkeypatch.setattr(bot, "download_nct", download)
+    monkeypatch.setattr(bot, "upload", upload)
+    context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+    url = "https://www.nhaccuatui.com/song/KEY1"
+    assert await bot.process_url(context, FakeStatus(), url, "nct") == "ok"
+    assert bot.load_uploaded() == {"1|nct:KEY1": 42}  # Target falls back to the status chat (1) in tests.
+    status = FakeStatus()
+    other_form = "https://www.nhaccuatui.com/bai-hat/ten-bai.KEY1.html"
+    assert await bot.process_url(context, status, other_form, "nct") == "skipped"
+    assert "đã có trong channel" in status.texts[-1]
+    assert download.await_count == upload.await_count == 1
+
+
+async def test_deleted_message_is_uploaded_again(monkeypatch):
+    bot.save_uploaded("@ch|nct:K", 7)
+    client = SimpleNamespace(get_messages=AsyncMock(return_value=None))
+    monkeypatch.setattr(bot, "mtproto", client)
+    assert not await bot.already_uploaded("@ch", "@ch|nct:K")
+    assert bot.load_uploaded() == {}
+    client.get_messages.assert_awaited_once_with("@ch", ids=7)
+
+
+async def test_record_is_trusted_when_it_cannot_be_checked(monkeypatch):
+    bot.save_uploaded("@ch|nct:K", 7)
+    assert await bot.already_uploaded("@ch", "@ch|nct:K")  # No MTProto
+    monkeypatch.setattr(bot, "mtproto", SimpleNamespace(get_messages=AsyncMock(side_effect=ValueError("no access"))))
+    assert await bot.already_uploaded("@ch", "@ch|nct:K")
+    assert not await bot.already_uploaded("@ch", "@ch|nct:OTHER")
+
+
+async def test_playlist_summary_counts_skipped(monkeypatch):
+    context, pl = playlist_context()
+    monkeypatch.setattr(bot, "process_url", AsyncMock(side_effect=["skipped", "ok", "skipped"]))
+    update = callback_update("pl:k1:go")
+    await bot.handle_playlist_choice(update, context)
+    assert update.callback_query.message.texts[-1] == (
+        "✅ Playlist Hits: tải xong 1/3 bài.\n⏭ Bỏ qua 2 bài đã có trong channel."
+    )
+
+
+def test_no_media_text():
+    zing = bot.no_media_text("https://zingmp3.vn/bai-hat/x/ID.html", Exception("ERROR: [zingmp3] ID: VIP"))
+    assert "Zing MP3 đang chặn" in zing
+    error = bot.yt_dlp.utils.DownloadError("ERROR: [generic] abc: Unsupported URL; please report this issue on ...")
+    assert bot.no_media_text("https://x.com/a", error).endswith("\n(Unsupported URL)")
+
+
+# --- nhac.vn ------------------------------------------------------------------------------------------------------
+
+
+def nhacvn_page(with_320=True):
+    sources = [{"file": "https://cdn/web1/1.mp3", "label": "128K"}]
+    if with_320:
+        sources.append({"file": "https://cdn/web2/1.mp3", "label": "320K"})
+    import json
+
+    return (
+        "<script>jwplayer('myaudio').setup({\n"
+        f"    sources: {json.dumps(sources).replace('/', '\\/')},\n"  # Escaped like the real page
+        "    title:'Tình Yêu Lung Linh',\n"
+        "    description:'Tuấn Hưng &amp; L\\'Amour',\n"
+        "});</script>"
+    )
+
+
+@pytest.mark.parametrize(
+    ("url", "key"),
+    [
+        ("https://nhac.vn/bai-hat/tinh-yeu-lung-linh-tuan-hung-so99Gbw", "so99Gbw"),
+        ("https://www.nhac.vn/bai-hat/tinh-yeu-lung-linh-tuan-hung-so99Gbw?x=1", "so99Gbw"),
+    ],
+)
+def test_nhacvn_url(url, key):
+    assert bot.NHACVN_RE.match(url).group(1) == key
+    assert bot.song_record("@ch", url, "nhacvn") == f"@ch|nhacvn:{key}"
+
+
+def test_nhacvn_song():
+    song = bot.nhacvn_song(nhacvn_page())
+    assert (song["title"], song["artist"]) == ("Tình Yêu Lung Linh", "Tuấn Hưng & L'Amour")
+    assert song["sources"] == {"128K": "https://cdn/web1/1.mp3", "320K": "https://cdn/web2/1.mp3"}
+    with pytest.raises(bot.yt_dlp.utils.DownloadError):
+        bot.nhacvn_song("<html></html>")
+
+
+@pytest.mark.parametrize(("with_320", "quality", "stream"), [(True, 320, "/web2/1.mp3"), (False, 128, "/web1/1.mp3")])
+async def test_download_nhacvn_prefers_320k(monkeypatch, tmp_path, with_320, quality, stream):
+    requested = []
+
+    def handler(request):
+        requested.append(request)
+        if request.url.host == "nhac.vn":
+            return httpx.Response(200, text=nhacvn_page(with_320))
+        return httpx.Response(200, content=b"ID3 audio")
+
+    mock_client(monkeypatch, handler)
+    progress = bot.Progress(FakeStatus(), asyncio.get_running_loop())
+    url = "https://nhac.vn/bai-hat/tinh-yeu-lung-linh-tuan-hung-so99Gbw"
+    path, info = await bot.download_nhacvn(url, str(tmp_path), progress)
+    assert path.name == "Tuấn Hưng & L'Amour - Tình Yêu Lung Linh.mp3"
+    assert (info["abr"], info["duration"]) == (quality, None)  # Not a real MP3, so no duration.
+    assert requested[1].url.path == stream
+    assert requested[1].headers["referer"] == "https://nhac.vn/"
+
+
+async def test_nhacvn_links_skip_ytdlp(monkeypatch):
+    process_url = AsyncMock()
+    classify = AsyncMock()
+    monkeypatch.setattr(bot, "process_url", process_url)
+    monkeypatch.setattr(bot, "classify_link", classify)
+    status = SimpleNamespace(edit_text=AsyncMock())
+    text = "https://nhac.vn/bai-hat/tinh-yeu-lung-linh-tuan-hung-so99Gbw"
+    message = tg_message(text, [("url", 0, len(text), None)])
+    message.reply_text = AsyncMock(return_value=status)
+    update = SimpleNamespace(effective_user=SimpleNamespace(id=111), message=message)
+    context = handler_context()
+    await bot.handle_links(update, context)
+    process_url.assert_awaited_once_with(context, status, text, "nhacvn")
     classify.assert_not_awaited()

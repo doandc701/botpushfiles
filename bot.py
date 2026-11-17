@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+import html as htmllib
 import json
 import logging
 import os
@@ -69,14 +70,22 @@ MAX_SIZE = MAX_SIZE_MB * 1024 * 1024
 # Optional proxy for downloads, e.g. http://host:8080 or socks5://host:1080
 PROXY = os.getenv("PROXY", "").strip() or None
 DOWNLOAD_DIR = HOME / "downloads"
+# Songs already uploaded, "<target>|nct:<song key>" -> message id, so playlists skip what the channel has.
+UPLOADED_PATH = HOME / "uploaded.json"
 # System ffmpeg if installed, otherwise the binary bundled with imageio-ffmpeg.
 FFMPEG = shutil.which("ffmpeg") or imageio_ffmpeg.get_ffmpeg_exe()
 
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 # NhacCuaTui song pages: /song/<key> and the older /bai-hat/<slug>.<key>.html. yt-dlp has no extractor for them.
 NCT_RE = re.compile(r"^https?://(?:www\.|m\.)?nhaccuatui\.com/(?:song/([\w-]+)|bai-hat/[^/?#]*\.([\w-]+)\.html)", re.I)
+NCT_PLAYLIST_RE = re.compile(
+    r"^https?://(?:www\.|m\.)?nhaccuatui\.com/playlist/(?:[^/?#]*\.([\w-]+)\.html|([\w-]+))(?:[/?#]|$)", re.I
+)
 # NhacCuaTui qualities from best to worst that Telegram plays in its music player; FLAC would arrive as a document.
 NCT_QUALITIES = ("320", "128")
+# nhac.vn song pages: /bai-hat/<slug>-<key>. yt-dlp's generic extractor picks up an ad jingle there, not the song.
+NHACVN_RE = re.compile(r"^https?://(?:www\.|m\.)?nhac\.vn/bai-hat/[\w-]*-([A-Za-z0-9]+)/?(?:[?#]|$)", re.I)
+NHACVN_QUALITIES = ("320K", "128K")  # Labels of the player's sources, best first
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
 AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".ogg", ".opus", ".flac", ".wav"}
 # Telegram only shows .mp3 / .m4a in its music player; other audio files are sent as documents.
@@ -94,6 +103,7 @@ TAKEOVER_GRACE = 60
 STARTED_AT = time.monotonic()
 # Format menus waiting for a choice that are remembered; older ones answer "link expired".
 MAX_PENDING = 200
+PLAYLIST_PAGE_SIZE = 10  # Songs per page of the playlist menu (Telegram allows ~100 buttons per message).
 UPLOAD_PART_SIZE = 512 * 1024  # The maximum MTProto allows.
 UPLOAD_PARALLEL = 8  # Parts in flight at once, so the upload isn't bound by round-trip latency.
 
@@ -163,9 +173,11 @@ def transfer_text(title: str, done: int, total: int | None, speed: float | None,
 class Progress:
     """Edits a status message, throttled; update() may be called from worker threads."""
 
-    def __init__(self, status, loop: asyncio.AbstractEventLoop):
+    def __init__(self, status, loop: asyncio.AbstractEventLoop, prefix: str = "", markup=None):
         self.status = status
         self.loop = loop
+        self.prefix = prefix  # Shown above every text, e.g. "bài 3/20".
+        self.markup = markup  # Keyboard kept on every edit (an edit without one removes it).
         self.lock = asyncio.Lock()
         self.seq = 0
         self.last = 0.0
@@ -186,10 +198,11 @@ class Progress:
     async def _edit(self, text: str, seq: int) -> None:
         async with self.lock:
             # Skip edits that a newer one has already superseded.
+            text = self.prefix + text
             if seq != self.seq or text == self.shown:
                 return
             try:
-                await self.status.edit_text(text, disable_web_page_preview=True)
+                await self.status.edit_text(text, disable_web_page_preview=True, reply_markup=self.markup)
                 self.shown = text
             except TelegramError as e:
                 log.debug("status edit failed: %r", e)
@@ -310,8 +323,8 @@ def ytdlp_opts(**extra) -> dict:
     return opts
 
 
-def nct_song(html: str, key: str | None) -> dict:
-    """The song record from a NhacCuaTui page's Nuxt payload, with references resolved one level deep."""
+def nuxt_data(html: str):
+    """A NhacCuaTui page's Nuxt payload (a flat array whose ints are references) and a resolver for references."""
     match = re.search(r'<script[^>]*id="__NUXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
     if not match:
         raise yt_dlp.utils.DownloadError("NhacCuaTui page has no song data")
@@ -319,6 +332,31 @@ def nct_song(html: str, key: str | None) -> dict:
 
     def value(ref):
         return data[ref] if isinstance(ref, int) and 0 <= ref < len(data) else ref
+
+    return data, value
+
+
+def nct_playlist(html: str) -> tuple[str | None, list[dict]]:
+    """(playlist name, songs in order as {key, title, artist}) from a NhacCuaTui playlist page."""
+    data, value = nuxt_data(html)
+    playlist = next((d for d in data if isinstance(d, dict) and "listSong" in d), None)
+    if playlist is None:
+        raise yt_dlp.utils.DownloadError("NhacCuaTui page has no playlist data")
+    songs = []
+    for ref in value(playlist["listSong"]) or ():
+        song = value(ref)
+        if isinstance(song, dict) and value(song.get("key")):
+            songs.append(
+                {"key": value(song["key"]), "title": value(song.get("name")), "artist": value(song.get("artistName"))}
+            )
+    if not songs:
+        raise yt_dlp.utils.DownloadError("NhacCuaTui playlist is empty")
+    return value(playlist.get("name")), songs
+
+
+def nct_song(html: str, key: str | None) -> dict:
+    """The song record from a NhacCuaTui page's Nuxt payload, with references resolved one level deep."""
+    data, value = nuxt_data(html)
 
     songs = [d for d in data if isinstance(d, dict) and "streamURL" in d and "key" in d]
     song = next((d for d in songs if value(d["key"]) == key), songs[0] if songs else None)
@@ -334,11 +372,10 @@ def nct_song(html: str, key: str | None) -> dict:
 
 
 async def download_nct(url: str, dest_dir: str, progress: Progress) -> tuple[Path, dict]:
-    match = NCT_RE.match(url)
     async with http_client() as client:
         resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
         resp.raise_for_status()
-    song = nct_song(resp.text, match and (match.group(1) or match.group(2)))
+    song = nct_song(resp.text, nct_key(url))
     by_quality = {s.get("type"): s["stream"] for s in song["streams"]}
     quality = next((q for q in NCT_QUALITIES if q in by_quality), None)
     if quality is None:
@@ -348,6 +385,47 @@ async def download_nct(url: str, dest_dir: str, progress: Progress) -> tuple[Pat
         by_quality[quality], dest_dir, progress, f"{name}.mp3", headers={"Referer": "https://www.nhaccuatui.com/"}
     )
     info = {"title": song["title"], "artist": song["artist"], "duration": song["duration"], "abr": int(quality)}
+    return path, info
+
+
+def nhacvn_song(html: str) -> dict:
+    """Title, artist and {label: mp3 url} from the jwplayer setup in a nhac.vn song page."""
+    sources = re.search(r"sources:\s*(\[.*?\])\s*,\s*\n", html, re.S)
+    if not sources:
+        raise yt_dlp.utils.DownloadError("nhac.vn page has no player sources")
+
+    def js_string(name: str) -> str | None:
+        match = re.search(rf"\b{name}\s*:\s*'((?:[^'\\]|\\.)*)'", html[sources.end() :])
+        if not match:
+            return None
+        return htmllib.unescape(re.sub(r"\\(.)", r"\1", match.group(1))).strip() or None
+
+    files = {s.get("label"): s["file"] for s in json.loads(sources.group(1)) if isinstance(s, dict) and s.get("file")}
+    return {"title": js_string("title"), "artist": js_string("description"), "sources": files}
+
+
+def mp3_duration(path: Path) -> int | None:
+    try:
+        from mutagen.mp3 import MP3
+
+        return int(MP3(path).info.length) or None
+    except Exception:  # Only used for the player's duration display; Telegram can do without it.
+        return None
+
+
+async def download_nhacvn(url: str, dest_dir: str, progress: Progress) -> tuple[Path, dict]:
+    async with http_client() as client:
+        resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+    song = nhacvn_song(resp.text)
+    quality = next((q for q in NHACVN_QUALITIES if q in song["sources"]), None)
+    if quality is None:
+        raise yt_dlp.utils.DownloadError("nhac.vn has no free MP3 for this song")
+    name = " - ".join(x for x in (song["artist"], song["title"]) if x) or "nhacvn"
+    path, _ = await download_direct(
+        song["sources"][quality], dest_dir, progress, f"{name}.mp3", headers={"Referer": "https://nhac.vn/"}
+    )
+    info = {"title": song["title"], "artist": song["artist"], "duration": mp3_duration(path), "abr": int(quality[:-1])}
     return path, info
 
 
@@ -434,18 +512,18 @@ def extract_audio(src: Path, acodec: str | None) -> Path:
     return dst
 
 
-async def send_file(bot, chat_id, path: Path, caption: str, info: dict) -> None:
+async def send_file(bot, chat_id, path: Path, caption: str, info: dict) -> int:
     ext = path.suffix.lower()
     duration = int(info["duration"]) if info.get("duration") else None
     # A local Bot API server reads the file straight from disk (the Path becomes a file:// URI),
     # which avoids loading multi-GB files into memory for a multipart upload.
     with nullcontext(path) if LOCAL_BOT_API_URL else path.open("rb") as f:
         if ext in VIDEO_EXTS:
-            await bot.send_video(
+            message = await bot.send_video(
                 chat_id, video=f, filename=path.name, caption=caption, duration=duration, supports_streaming=True
             )
         elif ext in PLAYER_AUDIO_EXTS:
-            await bot.send_audio(
+            message = await bot.send_audio(
                 chat_id,
                 audio=f,
                 filename=path.name,
@@ -455,7 +533,8 @@ async def send_file(bot, chat_id, path: Path, caption: str, info: dict) -> None:
                 performer=info.get("artist") or info.get("uploader"),
             )
         else:
-            await bot.send_document(chat_id, document=f, filename=path.name, caption=caption)
+            message = await bot.send_document(chat_id, document=f, filename=path.name, caption=caption)
+    return message.message_id
 
 
 async def upload_parts(path: Path, on_progress) -> InputFile | InputFileBig:
@@ -503,7 +582,7 @@ async def mtproto_peer(chat_id: int | str, message_id: int):
         return await mtproto.get_input_entity(chat_id)
 
 
-async def send_file_mtproto(peer, path: Path, caption: str, info: dict, progress: Progress) -> None:
+async def send_file_mtproto(peer, path: Path, caption: str, info: dict, progress: Progress) -> int:
     started = time.monotonic()
 
     def on_progress(done: int, total: int) -> None:
@@ -525,7 +604,7 @@ async def send_file_mtproto(peer, path: Path, caption: str, info: dict, progress
                 duration, title=info.get("title"), performer=info.get("artist") or info.get("uploader")
             )
         )
-    await mtproto.send_file(
+    message = await mtproto.send_file(
         peer,
         file,
         caption=caption,
@@ -534,6 +613,7 @@ async def send_file_mtproto(peer, path: Path, caption: str, info: dict, progress
         force_document=ext not in VIDEO_EXTS | PLAYER_AUDIO_EXTS,
         supports_streaming=ext in VIDEO_EXTS,
     )
+    return message.id
 
 
 async def keep_chat_action(bot, chat_id) -> None:
@@ -553,7 +633,8 @@ async def report_upload(progress: Progress, name: str, size: int) -> None:
 
 async def upload(
     context: ContextTypes.DEFAULT_TYPE, status, target, path: Path, caption: str, info: dict, progress: Progress
-) -> None:
+) -> int:
+    """Send path to target; returns the new message's id."""
     peer = None
     if mtproto:
         try:
@@ -565,19 +646,75 @@ async def upload(
         tasks.append(asyncio.create_task(report_upload(progress, path.name, path.stat().st_size)))
     try:
         if peer:
-            await send_file_mtproto(peer, path, caption, info, progress)
-        else:
-            await send_file(context.bot, target, path, caption, info)
+            return await send_file_mtproto(peer, path, caption, info, progress)
+        return await send_file(context.bot, target, path, caption, info)
     finally:
         for task in tasks:
             task.cancel()
 
 
-async def process_url(context: ContextTypes.DEFAULT_TYPE, status, url: str, fmt: str | None) -> None:
-    """Download url (directly, or with yt-dlp in format fmt) and upload it, reporting progress in status."""
-    target = TARGET_CHAT_ID or status.chat_id
-    progress = Progress(status, asyncio.get_running_loop())
+def nct_key(url: str) -> str | None:
+    match = NCT_RE.match(url)
+    return match and (match.group(1) or match.group(2))
+
+
+def song_record(target, url: str, fmt: str | None) -> str | None:
+    """The uploaded.json key for a song from a music site, the same whatever form its link takes."""
+    if fmt == "nct" and nct_key(url):
+        return f"{target}|nct:{nct_key(url)}"
+    if fmt == "nhacvn" and (match := NHACVN_RE.match(url)):
+        return f"{target}|nhacvn:{match.group(1)}"
+    return None
+
+
+def load_uploaded() -> dict:
     try:
+        return json.loads(UPLOADED_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_uploaded(record: str, message_id: int | None) -> None:
+    uploaded = load_uploaded()
+    if message_id is None:
+        uploaded.pop(record, None)
+    else:
+        uploaded[record] = message_id
+    tmp = UPLOADED_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(uploaded, ensure_ascii=False, indent=0), encoding="utf-8")
+    tmp.replace(UPLOADED_PATH)  # Atomic, so a crash never leaves half a file.
+
+
+async def already_uploaded(target, record: str) -> bool:
+    """Whether the song in record was uploaded to target and (when MTProto can tell) is still there."""
+    message_id = load_uploaded().get(record)
+    if message_id is None:
+        return False
+    if mtproto:
+        try:
+            if await mtproto.get_messages(target, ids=message_id) is None:
+                save_uploaded(record, None)  # Deleted from the channel: upload it again.
+                return False
+        except Exception as e:
+            log.info("can't check message %s in %s, trusting the record: %r", message_id, target, e)
+    return True
+
+
+async def process_url(
+    context: ContextTypes.DEFAULT_TYPE, status, url: str, fmt: str | None, prefix: str = "", markup=None
+) -> bool:
+    """Download url (directly, or with yt-dlp in format fmt) and upload it, reporting progress in status.
+
+    Returns "ok", "skipped" (a music-site song target already has) or "failed"; failures are reported in status,
+    not raised.
+    """
+    target = TARGET_CHAT_ID or status.chat_id
+    progress = Progress(status, asyncio.get_running_loop(), prefix, markup)
+    record = song_record(target, url, fmt)
+    try:
+        if record and await already_uploaded(target, record):
+            await progress.set(f"⏭ Bài này đã có trong channel, bỏ qua: {url}")
+            return "skipped"
         await context.bot.send_chat_action(status.chat_id, ChatAction.UPLOAD_DOCUMENT)
         await progress.set(f"⬇️ Đang tải: {url}")
         with tempfile.TemporaryDirectory(dir=DOWNLOAD_DIR) as tmp:
@@ -586,6 +723,8 @@ async def process_url(context: ContextTypes.DEFAULT_TYPE, status, url: str, fmt:
             started = time.monotonic()
             if fmt == "nct":
                 path, info = await download_nct(url, tmp, progress)
+            elif fmt == "nhacvn":
+                path, info = await download_nhacvn(url, tmp, progress)
             elif fmt:
                 path, info = await asyncio.to_thread(download_ytdlp, url, tmp, fmt, progress)
             else:
@@ -595,16 +734,19 @@ async def process_url(context: ContextTypes.DEFAULT_TYPE, status, url: str, fmt:
             if size > MAX_SIZE:
                 raise TooLarge(human_size(size))
             title = info.get("title")
-            if fmt == "nct":
+            if fmt in ("nct", "nhacvn"):
                 title = f"{' - '.join(x for x in (info.get('artist'), title) if x)} · MP3 {info['abr']} kbps"
             caption = f"{title[:900]}\n{url}" if title else url
             started = time.monotonic()
-            await upload(context, status, target, path, caption, info, progress)
+            message_id = await upload(context, status, target, path, caption, info, progress)
+            if record:
+                save_uploaded(record, message_id)
             upload_time = time.monotonic() - started
         await progress.set(
             f"✅ Xong: {path.name} ({human_size(size)})\n"
             f"⬇️ tải {human_time(download_time)} · ⬆️ upload {human_time(upload_time)}"
         )
+        return "ok"
     except TooLarge as e:
         hint = " Thử chọn 📱 MP4 360p hoặc 🎵 Audio gốc." if fmt == "mp4" else ""
         await progress.set(f"❌ File quá lớn ({e}), giới hạn {MAX_SIZE_MB} MB: {url}{hint}")
@@ -617,6 +759,7 @@ async def process_url(context: ContextTypes.DEFAULT_TYPE, status, url: str, fmt:
     except Exception as e:
         log.exception("upload failed for %s", url)
         await progress.set(f"❌ Lỗi upload {url}: {e}")
+    return "failed"
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -628,6 +771,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Giới hạn mỗi file: {MAX_SIZE_MB} MB.\n"
         f"User ID của bạn: {update.effective_user.id}"
     )
+
+
+# Sites whose yt-dlp extractor is broken, with the reason shown instead of the generic "no media" error.
+BROKEN_SITES = {
+    "zingmp3.vn": "Zing MP3 đang chặn mọi công cụ tải (lỗi đã được báo cho yt-dlp nhưng chưa sửa), "
+    "kể cả bài miễn phí. Hãy tìm bài trên NhacCuaTui hoặc YouTube rồi gửi link đó.",
+}
+
+
+def no_media_text(url: str, error: Exception) -> str:
+    host = (httpx.URL(url).host or "").removeprefix("www.").removeprefix("m.")
+    if host in BROKEN_SITES:
+        return f"❌ Không tải được: {url}\n{BROKEN_SITES[host]}"
+    # yt-dlp messages look like "ERROR: [site] id: reason; please report this issue ..."
+    reason = re.sub(r"^ERROR: (\[[^]]+\] )?([\w-]+: )?", "", str(error)).split("; please report")[0].strip()
+    return f"❌ Không tìm thấy video/audio trong trang: {url}" + (f"\n({reason[:300]})" if reason else "")
 
 
 async def handle_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -643,6 +802,12 @@ async def handle_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if NCT_RE.match(url):
             await process_url(context, status, url, "nct")
             continue
+        if NHACVN_RE.match(url):
+            await process_url(context, status, url, "nhacvn")
+            continue
+        if NCT_PLAYLIST_RE.match(url):
+            await show_playlist(context, status, url)
+            continue
         try:
             kind, info = await classify_link(url)
         except httpx.HTTPError as e:
@@ -654,7 +819,7 @@ async def handle_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             continue
         except yt_dlp.utils.DownloadError as e:
             log.info("no media found at %s: %r", url, e)
-            await status.edit_text(f"❌ Không tìm thấy video/audio trong trang: {url}", disable_web_page_preview=True)
+            await status.edit_text(no_media_text(url, e), disable_web_page_preview=True)
             continue
         if kind == "file":
             await process_url(context, status, url, None)
@@ -662,12 +827,7 @@ async def handle_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if kind == "audio":
             await process_url(context, status, url, "audio")
             continue
-        # Callback data is limited to 64 bytes, so keep the URL server-side under a short key.
-        key = uuid.uuid4().hex[:12]
-        pending = context.bot_data.setdefault("pending", {})
-        pending[key] = url
-        while len(pending) > MAX_PENDING:
-            pending.pop(next(iter(pending)))  # Forget the oldest unanswered menu.
+        key = remember(context, "pending", url)
         await status.edit_text(
             f"Chọn định dạng cho:\n{url}\n⏳ Đang tính dung lượng...",
             reply_markup=format_keyboard(key, {}),
@@ -716,6 +876,148 @@ async def handle_format_choice(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("⌛ Link đã hết hạn (bot vừa khởi động lại?), hãy gửi lại link.")
     else:
         await process_url(context, query.message, url, fmt)
+
+
+# --- NhacCuaTui playlists: pick songs (all ticked at first), then download them one by one ----------------------
+
+
+def remember(context: ContextTypes.DEFAULT_TYPE, name: str, value) -> str:
+    """Keep value in bot_data[name] under a short key that fits in callback data (limited to 64 bytes)."""
+    key = uuid.uuid4().hex[:12]
+    store = context.bot_data.setdefault(name, {})
+    store[key] = value
+    while len(store) > MAX_PENDING:
+        store.pop(next(iter(store)))  # Forget the oldest unanswered menu.
+    return key
+
+
+def song_label(song: dict) -> str:
+    return " - ".join(x for x in (song.get("artist"), song.get("title")) if x) or song["key"]
+
+
+def playlist_text(pl: dict) -> str:
+    return (
+        f"📃 Playlist: {pl['title'] or pl['url']} ({len(pl['songs'])} bài)\n"
+        f"Đã chọn {len(pl['selected'])}/{len(pl['songs'])} bài. Bấm vào bài để chọn / bỏ chọn."
+    )
+
+
+def playlist_keyboard(key: str, pl: dict) -> InlineKeyboardMarkup:
+    pages = max(1, -(-len(pl["songs"]) // PLAYLIST_PAGE_SIZE))
+    page = min(pl["page"], pages - 1)
+    first = page * PLAYLIST_PAGE_SIZE
+    rows = []
+    for i, song in enumerate(pl["songs"][first : first + PLAYLIST_PAGE_SIZE], start=first):
+        mark = "✅" if i in pl["selected"] else "⬜"
+        rows.append([InlineKeyboardButton(f"{mark} {i + 1}. {song_label(song)}"[:60], callback_data=f"pl:{key}:t:{i}")])
+    if pages > 1:
+        rows.append([
+            InlineKeyboardButton("◀️", callback_data=f"pl:{key}:p:{(page - 1) % pages}"),
+            InlineKeyboardButton(f"Trang {page + 1}/{pages}", callback_data=f"pl:{key}:noop"),
+            InlineKeyboardButton("▶️", callback_data=f"pl:{key}:p:{(page + 1) % pages}"),
+        ])  # fmt: skip
+    rows.append([
+        InlineKeyboardButton("☑️ Chọn hết", callback_data=f"pl:{key}:all"),
+        InlineKeyboardButton("⬜ Bỏ hết", callback_data=f"pl:{key}:none"),
+    ])  # fmt: skip
+    rows.append([
+        InlineKeyboardButton(f"⬇️ Tải {len(pl['selected'])} bài", callback_data=f"pl:{key}:go"),
+        InlineKeyboardButton("✖️ Huỷ", callback_data=f"pl:{key}:x"),
+    ])  # fmt: skip
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_playlist(context: ContextTypes.DEFAULT_TYPE, status, url: str) -> None:
+    try:
+        async with http_client() as client:
+            resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+        title, songs = nct_playlist(resp.text)
+    except (httpx.HTTPError, yt_dlp.utils.DownloadError) as e:
+        log.warning("playlist failed for %s: %r", url, e)
+        await status.edit_text(f"❌ Không đọc được playlist {url}: {type(e).__name__}: {e}")
+        return
+    pl = {"url": url, "title": title, "songs": songs, "selected": set(range(len(songs))), "page": 0}
+    key = remember(context, "playlists", pl)
+    await status.edit_text(playlist_text(pl), reply_markup=playlist_keyboard(key, pl), disable_web_page_preview=True)
+
+
+async def handle_playlist_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not is_allowed(update):
+        await query.answer("Bạn không có quyền dùng bot này.")
+        return
+    _, key, action, *arg = [*(query.data or "").split(":"), "", ""][:4]
+    playlists = context.bot_data.get("playlists", {})
+    pl = playlists.get(key)
+    if pl is None:
+        await query.answer()
+        await query.edit_message_text("⌛ Danh sách đã hết hạn (bot vừa khởi động lại?), hãy gửi lại link.")
+        return
+    if action == "stop":
+        pl["stop"] = True
+        await query.answer("Sẽ dừng sau bài đang tải.")
+        return
+    if pl.get("running"):
+        await query.answer("Playlist đang được tải.")
+        return
+    if action == "go" and not pl["selected"]:
+        await query.answer("Chưa chọn bài nào.")
+        return
+    await query.answer()
+    index = int(arg[0]) if arg and arg[0].isdigit() else None
+    if action == "t" and index is not None and index < len(pl["songs"]):
+        pl["selected"] ^= {index}
+    elif action == "p" and index is not None:
+        pl["page"] = index
+    elif action == "all":
+        pl["selected"] = set(range(len(pl["songs"])))
+    elif action == "none":
+        pl["selected"] = set()
+    elif action == "x":
+        playlists.pop(key, None)
+        await query.edit_message_text("✖️ Đã huỷ.")
+        return
+    elif action == "go":
+        pl["running"] = True  # A double tap on "Tải" must not start a second download.
+        await download_playlist(context, query.message, key, pl)
+        return
+    else:
+        return  # "noop" (the page number) or an unknown button
+    with suppress(TelegramError):  # "message is not modified" when nothing changed
+        await query.edit_message_text(
+            playlist_text(pl), reply_markup=playlist_keyboard(key, pl), disable_web_page_preview=True
+        )
+
+
+async def download_playlist(context: ContextTypes.DEFAULT_TYPE, status, key: str, pl: dict) -> None:
+    """Download and upload the selected songs one at a time, in playlist order, in one status message."""
+    stop = InlineKeyboardMarkup([[InlineKeyboardButton("⏹ Dừng", callback_data=f"pl:{key}:stop")]])
+    songs = [pl["songs"][i] for i in sorted(pl["selected"])]
+    failed = []
+    done = skipped = 0
+    for n, song in enumerate(songs, start=1):
+        if pl.get("stop"):
+            break
+        prefix = f"📃 {pl['title'] or 'Playlist'} · bài {n}/{len(songs)}: {song_label(song)}\n"
+        url = f"https://www.nhaccuatui.com/song/{song['key']}"
+        result = await process_url(context, status, url, "nct", prefix=prefix, markup=stop)
+        if result == "ok":
+            done += 1
+        elif result == "skipped":
+            skipped += 1
+        else:
+            failed.append(song_label(song))
+    context.bot_data.get("playlists", {}).pop(key, None)
+    lines = [f"✅ Playlist {pl['title'] or pl['url']}: tải xong {done}/{len(songs)} bài."]
+    if skipped:
+        lines.append(f"⏭ Bỏ qua {skipped} bài đã có trong channel.")
+    if pl.get("stop"):
+        lines.append("⏹ Đã dừng theo yêu cầu.")
+    if failed:
+        lines.append("❌ Lỗi: " + "; ".join(failed)[:3000])
+    with suppress(TelegramError):
+        await status.edit_text("\n".join(lines), disable_web_page_preview=True)
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -787,6 +1089,7 @@ def build_app() -> Application:
 
     app.add_handler(CommandHandler(["start", "help"], start))
     app.add_handler(CommandHandler(["up", "link"], handle_links))
+    app.add_handler(CallbackQueryHandler(handle_playlist_choice, pattern=r"^pl:"))
     app.add_handler(CallbackQueryHandler(handle_format_choice))
     file_filter = (
         filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.ANIMATION

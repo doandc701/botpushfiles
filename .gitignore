@@ -18,3 +18,5 @@ bot.log.1
 launcher.log
 tray.pid
 ui.pid
+uploaded.json
+uploaded.tmp

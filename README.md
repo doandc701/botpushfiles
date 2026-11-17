@@ -56,6 +56,13 @@ tới 2000 MB.
 - Link video (TikTok, YouTube, file .mp4...): bot hiện nút chọn 🎬 MP4 / 📱 MP4 360p / 🎵 Audio gốc.
 - Link không cần `https://` (vd `www.nhaccuatui.com/...`), link ẩn trong chữ cũng nhận.
 - Link bài hát NhacCuaTui: bot tải luôn MP3 320 kbps (không có thì 128 kbps), gửi vào trình phát nhạc Telegram.
+- Link bài hát nhac.vn (`nhac.vn/bai-hat/...`): cũng tải luôn MP3 320 kbps (không có thì 128 kbps).
+- Zing MP3 hiện không tải được: Zing chặn mọi công cụ tải, bot sẽ báo lý do.
+- Link playlist NhacCuaTui: bot hiện danh sách bài, mặc định chọn hết. Bấm vào bài để bỏ/chọn lại, ◀️ ▶️ để
+  sang trang, rồi bấm **⬇️ Tải**. Bot tải lần lượt từng bài; bấm **⏹ Dừng** để dừng sau bài đang tải.
+  Chỉ lấy được các bài hiện trên trang playlist (tối đa 100 bài).
+- Bài NhacCuaTui / nhac.vn đã upload lên channel thì bot bỏ qua, không tải lại (bot ghi nhớ trong `uploaded.json`).
+  Nếu tin nhắn của bài đó đã bị xoá khỏi channel, bot tải lại (cần upload MTProto để kiểm tra được).
 - Link chỉ có âm thanh (SoundCloud, file .mp3...): bot tải luôn, không hỏi. Âm thanh luôn giữ nguyên chất lượng gốc (không mã hoá lại).
 - Gửi file/ảnh/video/audio: bot copy sang `TARGET_CHAT_ID` (không giới hạn dung lượng).
 - `/start`: xem hướng dẫn và user ID của bạn.

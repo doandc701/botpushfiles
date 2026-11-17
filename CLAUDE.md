@@ -24,6 +24,13 @@ CI (`.github/workflows/ci.yml`) runs ruff + pytest on Python 3.12 and 3.14, Shel
 - Links come from Telegram entities (`extract_urls`), so `www.x.com` without a scheme works.
 - NhacCuaTui (`NCT_RE`, no yt-dlp extractor): `nct_song` reads the page's `__NUXT_DATA__` payload and
   `download_nct` fetches the free 320 kbps MP3 (else 128). FLAC exists but Telegram would send it as a document.
+- nhac.vn (`NHACVN_RE`): `nhacvn_song` reads the jwplayer `sources` (128K/320K MP3) from the page; yt-dlp's generic
+  extractor would grab an ad jingle instead. Zing MP3's yt-dlp extractor is broken (API -403), see `BROKEN_SITES`.
+- NCT playlists (`NCT_PLAYLIST_RE`): `nct_playlist` lists the songs; the checklist menu lives in
+  `bot_data["playlists"]` (callback data `pl:<key>:<action>`), and `download_playlist` runs each song through
+  `process_url(..., "nct")` in one status message. The page only holds the first 100 songs.
+- Duplicates: bots can't read channel history, so uploaded NCT / nhac.vn songs are recorded in `uploaded.json`
+  (`song_record`: `<target>|nct:<key>` → message id). `already_uploaded` skips them unless MTProto finds the message deleted.
 - Uploads: MTProto via Telethon when `TELEGRAM_API_ID/HASH` are set (real progress, 2000 MB), else the Bot API
   (local server at `LOCAL_BOT_API_URL` for 2000 MB, otherwise 50 MB). Files sent to the bot are `copy_message`d.
 - Takeover: only one machine may poll a token. On `Conflict` the bot exits with code 0 unless it started less than
