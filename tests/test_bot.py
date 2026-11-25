@@ -680,3 +680,24 @@ async def test_nhacvn_links_skip_ytdlp(monkeypatch):
     await bot.handle_links(update, context)
     process_url.assert_awaited_once_with(context, status, text, "nhacvn")
     classify.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://www.prod.facebook.com/share/v/1CVpamHGfq/", "https://www.facebook.com/share/v/1CVpamHGfq/"),
+        ("https://prod.facebook.com/reel/15?x=1", "https://www.facebook.com/reel/15?x=1"),
+        ("https://www.facebook.com/reel/15", "https://www.facebook.com/reel/15"),
+        ("https://notprod.facebook.com.evil.example/a", "https://notprod.facebook.com.evil.example/a"),
+    ],
+)
+def test_normalize_url(url, expected):
+    assert bot.normalize_url(url) == expected
+
+
+def test_facebook_prod_links_reach_ytdlp_extractor():
+    from yt_dlp.extractor.facebook import FacebookReelIE
+
+    text = "https://www.prod.facebook.com/reel/1506577301329891"
+    (url,) = bot.extract_urls(tg_message(text, [("url", 0, len(text), None)]))
+    assert FacebookReelIE.suitable(url)

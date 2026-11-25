@@ -222,8 +222,20 @@ def extract_urls(message: TgMessage) -> list[str]:
                 utf16 = text.encode("utf-16-le")
                 found.append(utf16[2 * entity.offset : 2 * (entity.offset + entity.length)].decode("utf-16-le"))
         found += URL_RE.findall(text)
-    urls = [u if re.match(r"https?://", u, re.I) else f"https://{u}" for u in found]
+    urls = [normalize_url(u if re.match(r"https?://", u, re.I) else f"https://{u}") for u in found]
     return list(dict.fromkeys(urls))  # De-duplicate, keeping order.
+
+
+# Hosts that yt-dlp doesn't recognise but that serve the same pages as a host it does.
+# Facebook's "Share" button sometimes gives www.prod.facebook.com links (and redirects keep that host).
+HOST_ALIASES = re.compile(r"^((?:[\w-]+\.)*prod\.facebook\.com)$", re.I)
+
+
+def normalize_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.hostname and HOST_ALIASES.match(parsed.hostname):
+        return parsed._replace(netloc="www.facebook.com").geturl()
+    return url
 
 
 def safe_name(name: str | None) -> str | None:
