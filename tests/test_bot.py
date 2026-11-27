@@ -201,6 +201,36 @@ def test_extract_audio_fails_on_silent_video(tmp_path):
         bot.extract_audio(video, None)
 
 
+def pick_formats(fmt: str, formats: list[dict]) -> list[str]:
+    with bot.yt_dlp.YoutubeDL({"quiet": True}) as ydl:
+        select = ydl.build_format_selector(bot.FORMATS[fmt][1]["format"])
+        merged = any(f["vcodec"] != "none" and f["acodec"] != "none" for f in formats)
+        ctx = {"formats": formats, "has_merged_format": merged, "incomplete_formats": False}
+        return [f["format_id"] for f in select(ctx)]
+
+
+TIKTOK_SOUND = {"format_id": "audio", "url": "s", "ext": "m4a", "vcodec": "none", "acodec": "aac"}
+
+
+def test_audio_of_tiktok_video_is_the_videos_own_soundtrack():
+    # TikTok's "audio" format is the post's background sound, a different track than the video plays.
+    video = {"format_id": "h264_540p", "url": "v", "ext": "mp4", "vcodec": "h264", "acodec": "aac", "tbr": 800}
+    assert pick_formats("audio", [video, TIKTOK_SOUND]) == ["h264_540p"]
+
+
+def test_audio_of_tiktok_slideshow_is_its_sound():
+    assert pick_formats("audio", [TIKTOK_SOUND]) == ["audio"]
+
+
+def test_audio_prefers_a_separate_audio_stream():
+    formats = [
+        {"format_id": "137", "url": "a", "ext": "mp4", "vcodec": "avc1", "acodec": "none", "tbr": 4000},
+        {"format_id": "140", "url": "b", "ext": "m4a", "vcodec": "none", "acodec": "mp4a", "abr": 128},
+        {"format_id": "18", "url": "c", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a", "tbr": 500},
+    ]
+    assert pick_formats("audio", formats) == ["140"]
+
+
 # --- Progress -----------------------------------------------------------------------------------------------------
 
 
@@ -701,3 +731,81 @@ def test_facebook_prod_links_reach_ytdlp_extractor():
     text = "https://www.prod.facebook.com/reel/1506577301329891"
     (url,) = bot.extract_urls(tg_message(text, [("url", 0, len(text), None)]))
     assert FacebookReelIE.suitable(url)
+
+
+# --- Posts that need a logged-in account --------------------------------------------------------------------------
+
+TIKTOK_LOGIN = bot.yt_dlp.utils.DownloadError(
+    "ERROR: [TikTok] 7659: This post may not be comfortable for some audiences. Log in for access. "
+    "Use --cookies-from-browser or --cookies for the authentication."
+)
+
+
+def test_cookies_file_is_used_only_when_present(monkeypatch, tmp_path):
+    monkeypatch.setattr(bot, "COOKIES_FILE", tmp_path / "cookies.txt")
+    assert "cookiefile" not in bot.ytdlp_opts()
+    assert "cookies.txt" in bot.no_media_text("https://vt.tiktok.com/x", TIKTOK_LOGIN)
+    (tmp_path / "cookies.txt").write_text("# Netscape HTTP Cookie File\n")
+    assert bot.ytdlp_opts()["cookiefile"] == str(tmp_path / "cookies.txt")
+    assert "hết hạn" in bot.no_media_text("https://vt.tiktok.com/x", TIKTOK_LOGIN)
+
+
+async def test_login_error_while_downloading(monkeypatch, tmp_path):
+    monkeypatch.setattr(bot, "DOWNLOAD_DIR", tmp_path)
+
+    def fail(*args):
+        raise TIKTOK_LOGIN
+
+    monkeypatch.setattr(bot, "download_ytdlp", fail)
+    status = FakeStatus()
+    context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+    assert await bot.process_url(context, status, "https://vt.tiktok.com/x", "mp4") == "failed"
+    assert status.texts[-1].startswith("🔒 Video này cần tài khoản đăng nhập")
+
+
+# --- Random 403s from TikTok --------------------------------------------------------------------------------------
+
+PAGE_403 = "ERROR: [TikTok] 7645: Unable to download webpage: HTTP Error 403: Forbidden (caused by <HTTPError 403>)"
+
+
+def fake_youtubedl(monkeypatch, outcomes):
+    """YoutubeDL whose extract_info raises or returns the next outcome; returns the list of calls."""
+    calls = []
+
+    class FakeYDL:
+        def __init__(self, opts):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def extract_info(self, url, **kwargs):
+            calls.append(url)
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+    monkeypatch.setattr(bot.yt_dlp, "YoutubeDL", FakeYDL)
+    monkeypatch.setattr(bot, "PAGE_403_DELAY", 0)
+    return calls
+
+
+def test_page_403_is_retried(monkeypatch):
+    calls = fake_youtubedl(monkeypatch, [bot.yt_dlp.utils.DownloadError(PAGE_403)] * 2 + [{"title": "ok"}])
+    assert bot.extract_info("https://www.tiktok.com/@a/video/1") == {"title": "ok"}
+    assert len(calls) == 3
+
+
+def test_page_403_gives_up_and_other_errors_are_not_retried(monkeypatch):
+    calls = fake_youtubedl(monkeypatch, [bot.yt_dlp.utils.DownloadError(PAGE_403)] * bot.PAGE_403_ATTEMPTS)
+    with pytest.raises(bot.yt_dlp.utils.DownloadError):
+        bot.extract_info("https://www.tiktok.com/@a/video/1")
+    assert len(calls) == bot.PAGE_403_ATTEMPTS
+    calls = fake_youtubedl(monkeypatch, [TIKTOK_LOGIN, {"title": "never"}])
+    with pytest.raises(bot.yt_dlp.utils.DownloadError):
+        bot.extract_info("https://www.tiktok.com/@a/video/1")
+    assert len(calls) == 1

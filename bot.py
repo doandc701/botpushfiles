@@ -69,6 +69,8 @@ MAX_SIZE_MB = int(os.getenv("MAX_SIZE_MB") or (2000 if LOCAL_BOT_API_URL or MTPR
 MAX_SIZE = MAX_SIZE_MB * 1024 * 1024
 # Optional proxy for downloads, e.g. http://host:8080 or socks5://host:1080
 PROXY = os.getenv("PROXY", "").strip() or None
+# Netscape-format cookies of a logged-in browser, for posts that need an account (age-restricted TikToks...).
+COOKIES_FILE = Path(os.getenv("COOKIES_FILE", "").strip() or HOME / "cookies.txt")
 DOWNLOAD_DIR = HOME / "downloads"
 # Songs already uploaded, "<target>|nct:<song key>" -> message id, so playlists skip what the channel has.
 UPLOADED_PATH = HOME / "uploaded.json"
@@ -104,6 +106,11 @@ STARTED_AT = time.monotonic()
 # Format menus waiting for a choice that are remembered; older ones answer "link expired".
 MAX_PENDING = 200
 PLAYLIST_PAGE_SIZE = 10  # Songs per page of the playlist menu (Telegram allows ~100 buttons per message).
+# Retries when a site refuses yt-dlp's page request with 403. TikTok does so for 40-50% of requests at random,
+# sometimes several in a row; waiting longer doesn't help, so retry often (all 8 failing is ~0.4%).
+PAGE_403_RE = re.compile(r"Unable to download webpage: HTTP Error 403")
+PAGE_403_ATTEMPTS = 8
+PAGE_403_DELAY = 1
 UPLOAD_PART_SIZE = 512 * 1024  # The maximum MTProto allows.
 UPLOAD_PARALLEL = 8  # Parts in flight at once, so the upload isn't bound by round-trip latency.
 
@@ -129,7 +136,9 @@ FORMATS = {
         },
     ),
     # Best audio stream as-is: extract_audio() copies it out without re-encoding, so quality is unchanged.
-    "audio": ("🎵 Audio gốc", {"format": "ba/b"}),
+    # TikTok also lists the post's background sound as format "audio": a different track (often an ad jingle)
+    # than the video's own soundtrack, so take the video's audio and keep "audio" for slideshows that have no video.
+    "audio": ("🎵 Audio gốc", {"format": "ba[format_id!=audio]/b/ba"}),
 }
 
 
@@ -283,9 +292,26 @@ async def classify_link(url: str) -> tuple[str, dict | None]:
     return ("audio" if is_audio_only(info) else "video"), info
 
 
+def ytdlp_extract(opts: dict, url: str, **kwargs) -> dict:
+    """YoutubeDL.extract_info, retried when the site refuses its page with 403.
+
+    TikTok answers about half of the page requests from yt-dlp with 403 at random, whatever browser it
+    impersonates; asking again usually works. Only the page fetch fails this way, so nothing was downloaded yet.
+    """
+    for attempt in range(1, PAGE_403_ATTEMPTS + 1):
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(url, **kwargs)
+        except yt_dlp.utils.DownloadError as e:
+            if attempt == PAGE_403_ATTEMPTS or not PAGE_403_RE.search(str(e)):
+                raise
+            log.info("page refused with 403 for %s, retrying (%d/%d)", url, attempt, PAGE_403_ATTEMPTS)
+            time.sleep(PAGE_403_DELAY)
+    raise AssertionError("unreachable")
+
+
 def extract_info(url: str) -> dict:
-    with yt_dlp.YoutubeDL(ytdlp_opts()) as ydl:
-        return ydl.extract_info(url, download=False, process=False)
+    return ytdlp_extract(ytdlp_opts(), url, download=False, process=False)
 
 
 def is_audio_only(info: dict) -> bool:
@@ -332,6 +358,8 @@ def ytdlp_opts(**extra) -> dict:
     }
     if PROXY:
         opts["proxy"] = PROXY
+    if COOKIES_FILE.is_file():
+        opts["cookiefile"] = str(COOKIES_FILE)
     return opts
 
 
@@ -498,8 +526,7 @@ def download_ytdlp(url: str, dest_dir: str, fmt: str, progress: Progress) -> tup
         postprocessor_hooks=[on_postprocess],
         **FORMATS[fmt][1],
     )
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+    info = ytdlp_extract(opts, url, download=True)
     files = [p for p in Path(dest_dir).iterdir() if p.is_file() and not p.name.endswith(".part")]
     if not files:
         # yt-dlp silently skips downloads above max_filesize.
@@ -767,7 +794,7 @@ async def process_url(
         await progress.set(f"❌ Không tách được âm thanh (video không có âm thanh?): {url}")
     except (httpx.HTTPError, yt_dlp.utils.DownloadError) as e:
         log.warning("download failed for %s: %r", url, e)
-        await progress.set(f"❌ Lỗi tải {url}: {type(e).__name__}: {e}")
+        await progress.set(login_text(url) if needs_login(e) else f"❌ Lỗi tải {url}: {type(e).__name__}: {e}")
     except Exception as e:
         log.exception("upload failed for %s", url)
         await progress.set(f"❌ Lỗi upload {url}: {e}")
@@ -792,7 +819,27 @@ BROKEN_SITES = {
 }
 
 
+def needs_login(error: Exception) -> bool:
+    text = str(error)
+    return "--cookies" in text or "Log in for access" in text or "Sign in to confirm" in text
+
+
+def login_text(url: str) -> str:
+    if COOKIES_FILE.is_file():
+        return (
+            f"🔒 Video này cần tài khoản đăng nhập (giới hạn độ tuổi / riêng tư): {url}\n"
+            f"Bot đã dùng {COOKIES_FILE.name} nhưng vẫn bị từ chối: cookie có thể đã hết hạn, hãy xuất lại."
+        )
+    return (
+        f"🔒 Video này cần tài khoản đăng nhập (giới hạn độ tuổi / riêng tư): {url}\n"
+        f"Đăng nhập trang đó trên trình duyệt, xuất cookie ra file cookies.txt (tiện ích \"Get cookies.txt LOCALLY\") "
+        f"rồi chép vào {COOKIES_FILE.parent}. Không cần khởi động lại bot."
+    )
+
+
 def no_media_text(url: str, error: Exception) -> str:
+    if needs_login(error):
+        return login_text(url)
     host = (httpx.URL(url).host or "").removeprefix("www.").removeprefix("m.")
     if host in BROKEN_SITES:
         return f"❌ Không tải được: {url}\n{BROKEN_SITES[host]}"

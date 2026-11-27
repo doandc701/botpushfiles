@@ -15,5 +15,6 @@ os.environ.update(
     MTPROTO_UPLOAD="0",
     MAX_SIZE_MB="1",
     PROXY="",
+    COOKIES_FILE=str(Path(__file__).resolve().parent / "no-cookies.txt"),  # Never the real cookies.txt
 )
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))

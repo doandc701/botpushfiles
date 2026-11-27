@@ -58,6 +58,10 @@ tới 2000 MB.
 - Link bài hát NhacCuaTui: bot tải luôn MP3 320 kbps (không có thì 128 kbps), gửi vào trình phát nhạc Telegram.
 - Link bài hát nhac.vn (`nhac.vn/bai-hat/...`): cũng tải luôn MP3 320 kbps (không có thì 128 kbps).
 - Zing MP3 hiện không tải được: Zing chặn mọi công cụ tải, bot sẽ báo lý do.
+- Video cần đăng nhập (TikTok giới hạn độ tuổi, bài riêng tư...): đăng nhập trang đó trên trình duyệt, dùng tiện ích
+  **Get cookies.txt LOCALLY** để xuất cookie ra `cookies.txt`, rồi chép vào thư mục dữ liệu của bot (thư mục dự án,
+  hoặc thư mục ở bảng trên nếu dùng app). Không cần khởi động lại bot. Muốn để chỗ khác thì đặt `COOKIES_FILE` trong `.env`.
+  Cookie hết hạn thì xuất lại.
 - Link playlist NhacCuaTui: bot hiện danh sách bài, mặc định chọn hết. Bấm vào bài để bỏ/chọn lại, ◀️ ▶️ để
   sang trang, rồi bấm **⬇️ Tải**. Bot tải lần lượt từng bài; bấm **⏹ Dừng** để dừng sau bài đang tải.
   Chỉ lấy được các bài hiện trên trang playlist (tối đa 100 bài).
@@ -111,7 +115,8 @@ Quy trình sửa code:
 
 ## Bảo mật
 
-- `.env`, `*.session` và `dist/` chứa token hoặc phiên đăng nhập của bot. Không commit, không gửi cho ai.
+- `.env`, `*.session`, `cookies.txt` và `dist/` chứa token hoặc phiên đăng nhập. Không commit, không gửi cho ai.
+  `cookies.txt` cho phép đăng nhập vào tài khoản của bạn: nên dùng tài khoản phụ.
 - Luôn đặt `ALLOWED_USER_IDS`. Nếu để trống, ai tìm thấy bot cũng dùng được, và có thể bắt máy chạy bot tải
   bất kỳ địa chỉ nào, kể cả địa chỉ trong mạng nội bộ.
 - Lộ token: @BotFather → `/revoke`, rồi xoá `mtproto.session` và cập nhật `.env`.

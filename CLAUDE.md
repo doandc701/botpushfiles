@@ -20,7 +20,10 @@ CI (`.github/workflows/ci.yml`) runs ruff + pytest on Python 3.12 and 3.14, Shel
 - Links: `classify_link` decides direct file / audio-only page / video page. Video pages get an inline menu
   (`FORMATS`); the URL is kept in `bot_data["pending"]` under a 12-hex key because callback data is limited to 64 bytes.
 - Downloads: httpx for direct files, yt-dlp for pages (with `curl_cffi` impersonation; TikTok returns 403 without it).
+  Even then TikTok refuses about half of the page requests with 403 at random, so `ytdlp_extract` retries those.
   Audio is copied out with ffmpeg without re-encoding (`extract_audio`).
+- Posts that need an account: yt-dlp uses `COOKIES_FILE` (default `<home>/cookies.txt`) when it exists;
+  `needs_login` turns yt-dlp's "--cookies" errors into instructions for the user.
 - Links come from Telegram entities (`extract_urls`), so `www.x.com` without a scheme works.
 - NhacCuaTui (`NCT_RE`, no yt-dlp extractor): `nct_song` reads the page's `__NUXT_DATA__` payload and
   `download_nct` fetches the free 320 kbps MP3 (else 128). FLAC exists but Telegram would send it as a document.
@@ -52,6 +55,6 @@ CI (`.github/workflows/ci.yml`) runs ruff + pytest on Python 3.12 and 3.14, Shel
 
 ## Rules
 
-- Never commit or print `.env`, `*.session` or `dist/` (they hold the bot token / login session).
+- Never commit or print `.env`, `*.session`, `cookies.txt` or `dist/` (they hold the bot token / login sessions).
 - Tests import `bot` with fake settings from `tests/conftest.py`; keep new module-level config overridable there.
 - The company network blocks YouTube/TikTok; a download failing with ConnectError here is not a code bug.
